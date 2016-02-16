@@ -1,5 +1,6 @@
 all: 
 	$(MAKE) -C src/ all
+	mkdir -p bin
 	mv src/main bin/brow
 clean:
 	rm bin/brow
