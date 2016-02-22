@@ -3,17 +3,17 @@ CC=$(CXX)
 NVCC=nvcc
 
 #  -Ofast -march=native -pipe -funroll-loops
-CFLAGS= -std=c++11 -O2 -ipo -I/usr/local/cuda-7.5/targets/x86_64-linux/include/ -march=native
+CFLAGS= -std=c++11 -O2 -ipo -I/usr/local/cuda-7.5/targets/x86_64-linux/include/ -march=native -g
 CXXFLAGS=$(CFLAGS) 
 
-NVFLAGS= -std=c++11 -arch=sm_53 -ccbin=$(CXX)
+NVFLAGS= -arch=sm_50 -O2 -ccbin=g++ -g
 
 LDFLAGS= -L/usr/local/cuda-7.5/lib64 
-LDLIBS=-lcuda -lcudart -lcublas -lcusolver
+LDLIBS=-lcuda -lcudart -lcublas -lcusolver -lcurand
 
 
-#CUOBJS= main.o lib.o
-OBJS= main.o
+CUOBJS= gpu.o
+OBJS= main.o 
 
 all:main
 
