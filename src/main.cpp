@@ -1,82 +1,88 @@
 /************************************************************************
  *           Brownian motion with hydrodynamic interactions             *
  ************************************************************************/
+/* Marc Melendez and Raul P. Pelaez 2016
+ *
+ *
+ *
+ */
 
 /*** Standard libraries ***/
 #include <stdio.h>
-#include <stdint.h>
-#include <math.h>
-
-#include"Rlib.h"
-
-
-/*** Simulation parameters ***/
+#include "Rlib.h"
 #include "parameters.h"
-#include"gpu.h"
+#include "gpu.h"
 
-/*** Auxiliary functions ***/
-cusolverHandle cu;
 
-/* Pseudorandom number generation */
-uint64_t s[2]; /* PRNG state */
+class CuBrow{
+  cuHandle cu; //This is a CUBLAS/CUSOLVER/CURAND wrapper, see Rlib.h
+  Xorshift128plus rng;
+  Timer tim;
+  int tstep; /* Time step counter */
+  float t; /* Time */
+  Vector R; /* Particle coordinates */
+  Vector F; /* External forces */
+  Vector dW; /* Wiener process */
+  //Matrix K; /* Shear tensor */ 
+  Matrix D; /* Rodne-Prager-Yamakawa diffusion tensor */
+  Matrix B; /* D = B·B^T */
+  //Vector KR(n); /* K·R */
+  Vector DF; /* D·F */
+  Vector BdW; /* B·dW */
+  void init(); /*Initialize all*/
+public:
+  CuBrow(int argc, char *argv[]);
+  ~CuBrow();  /*Free memory and reset GPU*/
+  void run(); /*Run simulation*/
+  
+};
 
-/* 64-bit (pseudo)random integer */
-uint64_t xorshift128plus(void){
-  uint64_t x = s[0];
-  uint64_t const y = s[1];
-  s[0] = y;
-  x ^= x << 23; // a
-  x ^= x >> 17; // b
-  x ^= y ^ (y >> 26); // c
-  s[1] = x;
-  return x + y;
-}
-
-/* Random number from a uniform distribution */
-float uniform(float min, float max){
-  return min + (xorshift128plus()/((float) RANDOM_MAX))*(max - min);
-}
-/*** Main program (Brownian dynamics with hydrodynamic interaction) ***/
-int main(int argc, char * argv[]){
+CuBrow::CuBrow(int argc, char *argv[]){
   if(argc>1)
     cudaSetDevice(atoi(argv[1]));
   else     cudaSetDevice(0);
-  Timer tim;
+  initCUDA(n,cu);
   tim.tic();
-  initCUDA(n, cu);
+  init();
+  //  printf("Initializing time: %.3e\n", tim.toc());
+}
+CuBrow::~CuBrow(){
+  R.freeGPU(); R.freeCPU();
+  F.freeGPU();
+  dW.freeGPU();
+  DF.freeGPU();
+  BdW.freeGPU();
+  D.freeGPU();
+  B.freeGPU();
+  cudaDeviceReset();
+}
+
+
+void CuBrow::init(){
+  /*Initialize vectors and matrices*/
+  /*R is the only variable that we will be downloading during execution
+    So it needsto be on pinned memory, thats the second argument*/
+  R   = Vector(n, true); 
+  F   = Vector(n); 
+  dW  = Vector(n); 
+  DF  = Vector(n); 
+  BdW = Vector(n); 
+  D = Matrix(n,n);
+  B = Matrix(n,n);
+  //KR = Vector(n);
+  //K = Matrix(n,n);
+
   int i, j, k, l; /* Indices */
-  int tstep = 0; /* Time step counter */
-  float t; /* Time */
-  float c1 = 0, c2 = 0; /* RPY diffusion tensor coefficients */
-
-  Vector R(n); /* Particle coordinates */
-  float Rij[3]; /* Vector joining two particles */
-  float distRij, R2; /* Distance between two particles and distance squared */
-  Vector F(n); /* External forces */
-  Vector dW(n); /* Wiener process */
-  /*Matrices are stored aligned in memory*/
-  //  Matrix K(n,n); /* Shear tensor */ 
-  Matrix D(n,n); /* Rodne-Prager-Yamakawa diffusion tensor */
-  Matrix B(n,n); /* D = B·B^T */
-  //  Vector KR(n); /* K·R */
-  Vector DF(n); /* D·F */
-  Vector BdW(n); /* B·dW */
-
-  /* The PRNG state must be seeded so that it is not everywhere zero. */
-  s[0] = 12679825035178159220u;
-  s[1] = 15438657923749336752u;
-
   /*** Initial conditions ***/
   for(i = 0; i < n; i++)
-    R[i] = uniform(-boxlength/2.0, boxlength/2.0);
-
-  /*** Dynamics ***/
+    R[i] = rng.uniform(-boxlength/2.0, boxlength/2.0);
 
   /* Shear tensor */
-  //  K.fill_with(0); /* Clear shear tensor */
+  //K.fill_with(0); /* Clear shear tensor */
   //for(i = 0; i < particles; i++)
   // K[3*i + 2][3*i + 1] = shear;
-  
+
+
   /* Diffusion tensor (diagonal boxes remain unchanged during execution) */
   for(i = 0; i < particles; i++){
     for(k = 0; k < 3; k++){
@@ -85,43 +91,62 @@ int main(int argc, char * argv[]){
         else D[3*i + k][3*i + l] = 0;
       }
     }
-  }
-  
+  } 
+  /*Upload all information to the GPU*/
   //  KR.upload();
   //  K.upload();
-  DF.upload();
-  BdW.upload();
-  D.upload();
+
+  /*We only need R in the CPU!*/
   R.upload();
-  F.upload();
-  dW.upload();
-  B.upload();
-  //  printf("Initializing time: %.3e\n", tim.toc());
-  //tim.tic();
+  DF.upload();  DF.freeCPU();
+  BdW.upload(); BdW.freeCPU();
+  D.upload();   D.freeCPU();
+  F.upload();   F.freeCPU();
+  dW.upload();  dW.freeCPU();
+  B.upload();   B.freeCPU();
+}
+
+
+void CuBrow::run(){ 
   cudaStream_t stream;
   cudaStreamCreate(&stream);
   cudaStream_t stream2;
   cudaStreamCreate(&stream2);
-
+  
+  tim.tic();
+  tstep = 0;
+  /*Main loop*/
   for(t = t0; t <= tmax; t += dt){
-    force_call(R.d_m, F.d_m, stream);
+    /*Compute forces*/
+    force_call(R.d_m, F.d_m, stream);//Execute on stream
+    /*Fill dW with noise*/
     cu.gaussian(dW);
-    rodne_call(D.d_m, R.d_m, stream2);
+    /*Perform rodne-prage on D*/
+    rodne_call(D.d_m, R.d_m, stream2); //Execute on stream2
+
     //cu.prod(K, R, KR); /* K·R, is always zero with shear = 0*/
-    cudaDeviceSynchronize();
+    
+    /*Wait for rodne-prage*/
+    cudaStreamSynchronize(stream2); 
+    /*Perform cholesky decomp. on D, store in B*/
     cu.chol_async(D, B);
+    /*DF = D·F*/
     cu.prod(D, F, DF, dt, 0.0); /* D·F·dt */
+    /*Fill upper part of B with 0*/
     cu.chol_finish(B);
-    cu.prod(B, dW, BdW, sqrt(2)*sqrt(dt), 0.0); /* B·dW·sqrt(2)·sqrt(dt) */
+    /* BdW = B·dW·sqrt(2)·sqrt(dt) */
+    cu.prod(B, dW, BdW, sqrt(2)*sqrt(dt), 0.0); 
+    /*Wait for all streams to finish*/
     cudaDeviceSynchronize();
-    /* dR = (K R + D F) dt + sqrt(2) B·dW */
+    /*Integrate the positions*/
+    /* dR = (K R + D F) dt + sqrt(2) B·dW  (now K is zero)*/
     cu.integrate(R, DF, BdW);
+
     /* Output results */
-      
     if(tstep % sampling == 0){
       R.download();
       printf("#\n");
-      for(i = 0; i < particles; i++)
+      for(int i = 0; i < particles; i++)
         printf("%f\t%f\t%f\n", R[3*i], R[3*i + 1], R[3*i + 2]);
       printf("\n");
     }
@@ -130,6 +155,10 @@ int main(int argc, char * argv[]){
   }
     
   //  printf("Execution time: %.3e\n", tim.toc());
-  cudaDeviceReset();
+}
+/*** Main program (Brownian dynamics with hydrodynamic interaction) ***/
+int main(int argc, char * argv[]){
+  CuBrow app(argc, argv);
+  app.run();
   return 0;
 }
